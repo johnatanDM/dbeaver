@@ -35,7 +35,7 @@ public abstract class DBGBaseSession implements DBGSession {
 
     private final DBGBaseController controller;
 
-    private FutureTask<DBGEvent> task;
+    protected FutureTask<DBGEvent> task;
 
     private Thread workerThread = null;
     
