@@ -50,6 +50,8 @@ public abstract class DBGBaseController implements DBGController {
     private static final Log log = Log.getLog(DBGBaseController.class);
 
     private final DBPDataSourceContainer dataSourceContainer;
+    
+    private DBRProgressMonitor monitor;
 
     private final Map<String, Object> configuration = new HashMap<String, Object>();
     private final Map<Object, DBGSession> sessions = new HashMap<Object, DBGSession>(1);
@@ -70,6 +72,10 @@ public abstract class DBGBaseController implements DBGController {
         return executionContext;
     }
     
+    public DBRProgressMonitor getMonitor() {
+        return monitor;
+    }
+
     @Override
     public void init(Map<String, Object> context) {
         this.configuration.putAll(context);
@@ -82,6 +88,7 @@ public abstract class DBGBaseController implements DBGController {
             throw new DBGException("Not connected to database");
         }
         try {
+            this.monitor = monitor;
             this.executionContext = dataSource.openIsolatedContext(monitor, "Debug controller");
             DBGSessionInfo targetInfo = getSessionDescriptor(getExecutionContext());
             DBCExecutionContext sessionContext = dataSource.openIsolatedContext(monitor, "Debug session");

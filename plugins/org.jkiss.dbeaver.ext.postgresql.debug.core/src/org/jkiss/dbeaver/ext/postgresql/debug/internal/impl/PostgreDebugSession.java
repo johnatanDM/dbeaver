@@ -18,13 +18,25 @@
 
 package org.jkiss.dbeaver.ext.postgresql.debug.internal.impl;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.Status;
+import org.eclipse.core.runtime.jobs.Job;
+import org.jkiss.dbeaver.DBException;
+import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.debug.DBGBaseController;
 import org.jkiss.dbeaver.debug.DBGBaseSession;
 import org.jkiss.dbeaver.debug.DBGBreakpointDescriptor;
@@ -33,7 +45,10 @@ import org.jkiss.dbeaver.debug.DBGException;
 import org.jkiss.dbeaver.debug.DBGSessionInfo;
 import org.jkiss.dbeaver.debug.DBGStackFrame;
 import org.jkiss.dbeaver.debug.DBGVariable;
+import org.jkiss.dbeaver.debug.core.DebugCore;
+import org.jkiss.dbeaver.model.DBPDataSource;
 import org.jkiss.dbeaver.model.impl.jdbc.JDBCExecutionContext;
+import org.jkiss.dbeaver.model.runtime.VoidProgressMonitor;
 
 /**
  * Typical scenario for debug session <br/>
@@ -56,11 +71,28 @@ public class PostgreDebugSession extends DBGBaseSession {
     private final Object targetId;
 
     private int sessionId = -1;
-
+    
+    private int localPortNumber = -1;
+    
+    private PostgreDebugAttachKind attachKind = PostgreDebugAttachKind.UNKNOWN;
+    
+    private Statement localStatement; 
+    
+    private static final int LOCAL_WAIT = 500; //0.5 sec
+    
+    private static final int LOCAL_TIMEOT = 50 * 1000; //50 sec
+    
+    private static final String MAGIC_PORT = "PLDBGBREAK";
+    
     private static final String SQL_ATTACH = "select pldbg_wait_for_target(?sessionid)";
+    
+    private static final String SQL_ATTACH_TO_PORT = "select pldbg_attach_to_port(?portnumber)";
 
+    private static final String SQL_PREPARE_SLOT = " select pldbg_oid_debug(?objectid)";
 
     private static final String SQL_LISTEN = "select pldbg_create_listener() as sessionid";
+    
+    private static final String SQL_GET_SRC = "select pldbg_get_source(?sessionid,?oid)";
 
     private static final String SQL_GET_VARS = "select * from pldbg_get_variables(?sessionid)";
     
@@ -80,6 +112,8 @@ public class PostgreDebugSession extends DBGBaseSession {
     private static final String SQL_SET_BREAKPOINT = "select pldbg_set_breakpoint(?sessionid, ?obj, ?line)";
     private static final String SQL_DROP_BREAKPOINT = "select pldbg_drop_breakpoint(?sessionid, ?obj, ?line)";
     private static final String SQL_ATTACH_BREAKPOINT = "select pldbg_wait_for_breakpoint(?sessionid)";
+    
+    private static final Log log = Log.getLog(PostgreDebugSession.class);
 
     /**
      * Create session with two description 
@@ -94,6 +128,186 @@ public class PostgreDebugSession extends DBGBaseSession {
         this.sessionInfo = sessionInfo;
         this.targetId = targetId;
     }
+    
+    private boolean localPortRcv(SQLWarning warn) {
+        
+        if (warn != null) {
+            
+             String notice = warn.getMessage();
+             
+             while(notice != null) {
+                 
+                 if (notice.startsWith(MAGIC_PORT)) {
+                     
+                    try {
+                         localPortNumber =  Integer.valueOf(notice.substring(MAGIC_PORT.length()+1).trim());   
+                    } catch (Exception e) {
+                        return false;
+                    }
+                     
+                     return true;
+                 } 
+
+                 warn = warn.getNextWarning();
+                 
+                 notice = warn == null ? null : warn.getMessage(); 
+                 
+             }
+        }
+        
+        return false;
+    }
+    
+    private int attachToPort() throws DBGException{
+        
+        String sql = SQL_ATTACH_TO_PORT.replaceAll("\\?portnumber", String.valueOf(localPortNumber));
+        try (Statement stmt = getConnection().createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+           if (rs.next()) {
+               return rs.getInt(1);
+            }
+           
+           throw new DBGException("Error while attaching to port");
+
+        } catch (SQLException e) {
+            throw new DBGException("Error attaching to port", e);
+        }
+    }
+    
+    private void createSlot(Connection executionTarget,int OID) throws DBGException{
+        
+        String sql = SQL_PREPARE_SLOT.replaceAll("\\?objectid", String.valueOf(OID));
+        try (Statement stmt = executionTarget.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+           if (!rs.next()) {
+               throw new DBGException("Error creating target slot");
+            }
+
+        } catch (SQLException e) {
+            throw new DBGException("Error creating target", e);
+        }
+    }
+    
+    private Connection createExecutionTarget() throws DBGException{
+
+        DBPDataSource dataSource = getController().getDataSourceContainer().getDataSource();
+        if (!getController().getDataSourceContainer().isConnected()) {
+            throw new DBGException("Not connected to database");
+        }
+        
+        try {
+            return ((JDBCExecutionContext) dataSource.openIsolatedContext(getController().getMonitor(), "Target debug session")).getConnection(new VoidProgressMonitor());
+        } catch (DBException | SQLException e) {
+            throw new DBGException("Error creating target session",e);
+        }
+    }
+    
+    private void waitPortNumber() throws DBGException {
+        
+        int totalWait = 0;
+        
+        while (totalWait < LOCAL_TIMEOT) {
+            
+            try {
+                
+                if (localStatement != null) {
+                    
+                        if (localPortRcv(localStatement.getWarnings())) {
+                            break;
+                        }
+                    
+                }
+                
+                //Please forgive me !
+                Thread.sleep(LOCAL_WAIT);
+                
+            } catch (SQLException | InterruptedException e) {
+                throw new DBGException("Error rcv port number");
+            }
+            
+            totalWait += LOCAL_WAIT;
+            
+        }
+        
+        if (localPortNumber < 0) {
+            throw new DBGException("Unable to rcv port number");
+        }
+    }
+    
+    protected void runProc(Connection connection,String commandSQL, String name, DBGEvent event) throws DBGException {
+        
+        
+        Job job = new Job(name) {
+            
+            @Override
+            protected IStatus run(IProgressMonitor monitor) {
+                try {
+                    try (final Statement stmt = connection.createStatement()) {
+                        localStatement = stmt;                          
+                        stmt.execute(commandSQL);
+                        stmt.close();
+                        connection.close();
+                        
+                    }
+                } catch (SQLException e) {
+                    log.error(name, e);
+                    return DebugCore.newErrorStatus(name, e);
+                    
+                }
+                return Status.OK_STATUS;
+            }
+        };
+        job.schedule();
+    }
+        
+        
+    private void attachLocal(int OID,String call) throws DBGException {
+        
+        Connection executionTarget = createExecutionTarget();
+         
+        createSlot(executionTarget, OID);
+        
+        String taskName = "Local attached to " + String.valueOf(targetId);
+        
+        runProc(executionTarget, call, taskName, new DBGEvent(this, DBGEvent.FINISHED));
+
+        waitPortNumber();
+        
+        sessionId =  attachToPort();
+        
+        try {
+            getConnection().setClientInfo("ApplicationName", "Debug Mode (local) : " + String.valueOf(sessionId));
+        } catch (SQLClientInfoException e) {
+            log.warn("Unable to set Application name", e);
+            e.printStackTrace();
+        }
+
+    }
+    
+    private void attachGlobal(int OID,int targetPID) throws DBGException {
+        
+        try (Statement stmt = getConnection().createStatement();
+                ResultSet rs = stmt.executeQuery(SQL_LISTEN)) {
+
+            if (rs.next()) {
+                sessionId =  rs.getInt("sessionid");
+                getConnection().setClientInfo("ApplicationName", "Debug Mode : " + String.valueOf(sessionId));
+            } else {
+                throw new DBGException("Unable to create debug instance");
+            }
+
+        } catch (SQLException e) {
+            throw new DBGException("SQL error", e);
+        } 
+
+        PostgreDebugBreakpointProperties properties = new PostgreDebugBreakpointProperties(true);
+        PostgreDebugObjectDescriptor obj = new PostgreDebugObjectDescriptor(OID,"ENTRY","SESSION","THIS","PG"); 
+        PostgreDebugBreakpointDescriptor bp = new PostgreDebugBreakpointDescriptor(obj, properties);
+        addBreakpoint(bp);
+        
+        String sessionParam = String.valueOf(getSessionId());
+        String taskName = sessionParam + " global attached to " + String.valueOf(targetId);
+        runAsync(SQL_ATTACH.replaceAll("\\?sessionid", sessionParam), taskName, new DBGEvent(this, DBGEvent.ATTACH));
+        
+    }
 
     /**
      * This method attach debug session to debug object (procedure) 
@@ -102,9 +316,11 @@ public class PostgreDebugSession extends DBGBaseSession {
      * @param connection - connection for debug session after attach this connection will forever belong to debug
      * @param OID - OID for target procedure
      * @param targetPID - target session PID (-1 for any target)
+     * @param global - is   target session global
+     * @param call - SQL call for target session 
      * @throws DBGException
      */
-    public void attach(JDBCExecutionContext connection,int OID,int targetPID) throws DBGException {
+    public void attach(JDBCExecutionContext connection,int OID,int targetPID,boolean global,String call) throws DBGException {
 
         lock.writeLock().lock();
 
@@ -112,43 +328,22 @@ public class PostgreDebugSession extends DBGBaseSession {
             
             setConnection(connection);
             
-            try (Statement stmt = getConnection().createStatement();
-                    ResultSet rs = stmt.executeQuery(SQL_LISTEN)) {
-
-                if (rs.next()) {
-                    sessionId =  rs.getInt("sessionid");
-                    getConnection().setClientInfo("ApplicationName", "Debug Mode : " + String.valueOf(sessionId));
-                } else {
-                    throw new DBGException("Unable to create debug instance");
-                }
-
-            } catch (SQLException e) {
-                throw new DBGException("SQL error", e);
-            } 
-
-            PostgreDebugBreakpointProperties properties = new PostgreDebugBreakpointProperties(true);
-            PostgreDebugObjectDescriptor obj = new PostgreDebugObjectDescriptor(OID,"ENTRY","SESSION","THIS","PG"); 
-            PostgreDebugBreakpointDescriptor bp = new PostgreDebugBreakpointDescriptor(obj, properties);
-            addBreakpoint(bp);
-            
-            String sessionParam = String.valueOf(getSessionId());
-            String taskName = sessionParam + " global attached to " + String.valueOf(targetId);
-            runAsync(SQL_ATTACH.replaceAll("\\?sessionid", sessionParam), taskName, new DBGEvent(this, DBGEvent.ATTACH));
-
-            /*if (breakpoint) {
-                runAsync(SQL_ATTACH_BREAKPOINT.replaceAll("\\?sessionid", String.valueOf(sessionId)),
-                        String.valueOf(sessionId) + " breakpoint attached to "
-                                + String.valueOf(sessionManagerInfo.pid));
-
-            } else {
-                runAsync(SQL_ATTACH.replaceAll("\\?sessionid", String.valueOf(sessionId)),
-                        String.valueOf(sessionId) + " global attached to " + String.valueOf(sessionManagerInfo.pid));
-            }*/
-
+            if (global) {
+                attachGlobal(OID, targetPID);
+                attachKind = PostgreDebugAttachKind.GLOBAL;
+            } else {                
+                attachLocal(OID,call);
+                attachKind = PostgreDebugAttachKind.LOCAL;
+            }
+ 
         } finally {
             lock.writeLock().unlock();
         }
 
+        log.warn(getSource(OID));
+        
+
+        
     }
 
     @Override
@@ -208,10 +403,11 @@ public class PostgreDebugSession extends DBGBaseSession {
 
         try {
             DBGEvent event = new DBGEvent(this, DBGEvent.RESUME, eventDetail);
-
+ 
             runAsync(commandSQL.replaceAll("\\?sessionid", String.valueOf(sessionId)),
-                    String.valueOf(sessionId) + name + String.valueOf(targetId), event);
-
+                        String.valueOf(sessionId) + name + String.valueOf(targetId), event);
+                
+ 
         } finally {
             lock.writeLock().unlock();
         }
@@ -321,6 +517,37 @@ public class PostgreDebugSession extends DBGBaseSession {
         return stack;
     }
 
+    /**
+     * Return source for func OID in  debug session  
+     * 
+     * @return String
+     */
+
+    public String getSource(int OID) throws DBGException{
+        
+        acquireReadLock();
+
+        String src = "";
+
+        String sql = SQL_GET_SRC.replaceAll("\\?sessionid", String.valueOf(sessionId))
+                .replaceAll("\\?oid", String.valueOf(OID));
+        try (Statement stmt = getConnection().createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+
+            while (rs.next()) {
+                src = rs.getString(1);
+            }
+
+        } catch (SQLException e) {
+            throw new DBGException("SQL error", e);
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        return src;
+        
+        
+    }
+    
     @Override
     public String toString() {
         return "PostgreDebugSession " + (isWaiting() ? "WAITING" : "READY") + " [sessionId=" + sessionId + ", breakpoints=" + getBreakpoints() + "targetId=("
@@ -338,7 +565,50 @@ public class PostgreDebugSession extends DBGBaseSession {
      * @return boolean
      */
     public boolean isAttached() {
-        return super.isAttached() && (sessionId > 0);
+        switch (attachKind) {
+        case GLOBAL:
+            return super.isAttached() && (sessionId > 0);
+        case LOCAL:
+            return sessionId > 0;
+        default:
+            return false;
+        }
+        
     }
-
+    
+    /**
+     * Return true if session waiting target connection (on breakpoint, after
+     * step or continue) in debug thread
+     * 
+     * @return boolean
+     */
+    public boolean isDone() {
+        switch (attachKind) {
+        case GLOBAL: 
+            if (task == null) {
+                return true;
+            }
+            if (task.isDone()) {
+                try {
+                    DBGEvent dbgEvent = task.get();
+                    getController().fireEvent(dbgEvent);
+                } catch (InterruptedException e) {
+                    log.error("DEBUG INTERRUPT ERROR ", e);
+                    return false;
+                } catch (ExecutionException e) {
+                    log.error("DEBUG WARNING ", e);
+                    return false;
+                }
+                return true;
+            }
+            return false;
+        case LOCAL:
+            
+            return sessionId > 0;
+        default:
+            return false;
+        }    
+    } 
+    
+    
 }

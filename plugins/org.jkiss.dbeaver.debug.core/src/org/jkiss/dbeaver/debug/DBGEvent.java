@@ -28,6 +28,7 @@ public class DBGEvent extends EventObject {
     public static final int SUSPEND = 0x0002;
     public static final int RESUME = 0x0004;
     public static final int DETACH = 0x0008;
+    public static final int FINISHED = 0x0099;
 
     public static final int UNSPECIFIED = 0;
     public static final int STEP_INTO = 0x0001;
